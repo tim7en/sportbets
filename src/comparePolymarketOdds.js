@@ -6,6 +6,8 @@ const Database = require("better-sqlite3");
 const { parseMatchTeams, teamSimilarity } = require("./nameMatch");
 const { classifyQuestion } = require("./polymarketMarketTypes");
 
+const LINE_EPSILON = 0.001;
+
 const FORBIDDEN_EVENT_TITLE_PATTERNS = [
   /more markets/i,
   /top goalscorer/i,
@@ -141,7 +143,6 @@ function loadCompareMarketCrosswalk() {
   const comparableMarkets = Array.isArray(loaded.comparableMarkets)
     ? loaded.comparableMarkets
         .filter((rule) => rule && rule.enabled !== false)
-        .filter((rule) => String(rule.bookmakerMarketKey || "h2h") === "h2h")
     : [];
 
   return {
@@ -204,12 +205,126 @@ function getBestOdds(db, gameId) {
   return row;
 }
 
+function getBestTotalOdds(db, gameId, line) {
+  const row = db
+    .prepare(
+      `
+      SELECT
+        MAX(CASE WHEN lower(outcome_name) = 'over' AND ABS(point - ?) < ? THEN price END) AS over_best,
+        MAX(CASE WHEN lower(outcome_name) = 'under' AND ABS(point - ?) < ? THEN price END) AS under_best
+      FROM odds
+      WHERE game_id = ? AND market_key = 'totals'
+    `
+    )
+    .get(line, LINE_EPSILON, line, LINE_EPSILON, gameId);
+
+  if (!row || !row.over_best || !row.under_best) {
+    return null;
+  }
+
+  return row;
+}
+
+function getBestSpreadOdds(db, gameId, selections) {
+  const outcomeNames = Object.keys(selections || {});
+  if (outcomeNames.length !== 2) {
+    return null;
+  }
+
+  const firstName = outcomeNames[0];
+  const secondName = outcomeNames[1];
+  const firstPoint = selections[firstName];
+  const secondPoint = selections[secondName];
+
+  const row = db
+    .prepare(
+      `
+      SELECT
+        MAX(CASE WHEN lower(outcome_name) = lower(?) AND ABS(point - ?) < ? THEN price END) AS first_best,
+        MAX(CASE WHEN lower(outcome_name) = lower(?) AND ABS(point - ?) < ? THEN price END) AS second_best
+      FROM odds
+      WHERE game_id = ? AND market_key = 'spreads'
+    `
+    )
+    .get(
+      firstName,
+      firstPoint,
+      LINE_EPSILON,
+      secondName,
+      secondPoint,
+      LINE_EPSILON,
+      gameId
+    );
+
+  if (!row || !row.first_best || !row.second_best) {
+    return null;
+  }
+
+  return {
+    [firstName]: row.first_best,
+    [secondName]: row.second_best,
+  };
+}
+
 function impliedProbFromDecimal(odds) {
   const x = Number(odds);
   if (!Number.isFinite(x) || x <= 1) {
     return null;
   }
   return 1 / x;
+}
+
+function resolveComparableMarketType(event, market) {
+  const sportsMarketType = String(market.sportsMarketType || "")
+    .trim()
+    .toLowerCase();
+  const classifiedType = classifyQuestion(
+    event.title,
+    market.question,
+    Array.isArray(market.outcomes) ? market.outcomes : []
+  );
+
+  if (classifiedType === "yes_no_team_win") {
+    return "yes_no_team_win";
+  }
+  if (sportsMarketType === "moneyline" || classifiedType === "match_winner") {
+    return "match_winner";
+  }
+  if (
+    sportsMarketType === "totals" ||
+    classifiedType === "total_over_under" ||
+    classifiedType === "match_total_over_under"
+  ) {
+    return "total_over_under";
+  }
+  if (sportsMarketType === "spreads") {
+    return "spread";
+  }
+
+  return classifiedType;
+}
+
+function isActionablePolymarketMarket(event, market) {
+  const includeInPlay = String(process.env.COMPARE_INCLUDE_INPLAY || "false")
+    .trim()
+    .toLowerCase() === "true";
+
+  if (!market || market.archived || market.closed || market.acceptingOrders === false) {
+    return false;
+  }
+
+  if (includeInPlay) {
+    return market.active !== false;
+  }
+
+  const startTime = new Date(
+    market.gameStartTime || event.start_time || event.end_time || 0
+  ).getTime();
+  if (Number.isFinite(startTime) && startTime <= Date.now()) {
+    return false;
+  }
+
+  return market.active !== false;
 }
 
 function findBestGameMatch(event, games) {
@@ -280,10 +395,11 @@ function pickBestMarketForTeams(event, homeTeam, awayTeam, allowedMarketTypes) {
 
   for (const market of markets) {
     const outcomes = Array.isArray(market.outcomes) ? market.outcomes : [];
-    const marketType = classifyQuestion(event.title, market.question, outcomes);
+    const marketType = resolveComparableMarketType(event, market);
     if (
       marketType !== "match_winner" ||
-      !isAllowedCompareMarketType(marketType, allowedMarketTypes)
+      !isAllowedCompareMarketType(marketType, allowedMarketTypes) ||
+      !isActionablePolymarketMarket(event, market)
     ) {
       continue;
     }
@@ -328,6 +444,86 @@ function pickYesProbability(outcomes) {
   return yes && Number.isFinite(Number(yes.probability))
     ? Number(yes.probability)
     : null;
+}
+
+function pickOverUnderProbabilities(outcomes) {
+  const over = (outcomes || []).find(
+    (outcome) => String(outcome.name || "").trim().toLowerCase() === "over"
+  );
+  const under = (outcomes || []).find(
+    (outcome) => String(outcome.name || "").trim().toLowerCase() === "under"
+  );
+
+  if (!over || !under) {
+    return null;
+  }
+
+  const overProbability = Number(over.probability);
+  const underProbability = Number(under.probability);
+  if (!Number.isFinite(overProbability) || !Number.isFinite(underProbability)) {
+    return null;
+  }
+
+  return {
+    Over: overProbability,
+    Under: underProbability,
+  };
+}
+
+function parseSignedPointEntries(question) {
+  const cleaned = String(question || "").replace(/\s+/g, " ").trim();
+  const entries = [];
+  const regex = /([^()]+?)\s*\(([+-]?\d+(?:\.\d+)?)\)/g;
+  let match;
+
+  while ((match = regex.exec(cleaned))) {
+    const rawLabel = String(match[1] || "")
+      .replace(/^.*?:\s*/g, "")
+      .replace(/\bvs\b\s*$/i, "")
+      .trim();
+    const point = Number(match[2]);
+    if (!rawLabel || !Number.isFinite(point)) {
+      continue;
+    }
+    entries.push({
+      label: rawLabel,
+      point,
+    });
+  }
+
+  return entries;
+}
+
+function mapSpreadOutcomePoints(question, outcomes) {
+  const namedOutcomes = (outcomes || []).filter((outcome) => outcome.name);
+  if (namedOutcomes.length !== 2) {
+    return null;
+  }
+
+  const entries = parseSignedPointEntries(question);
+  const mapped = {};
+
+  for (const entry of entries) {
+    let best = null;
+    for (const outcome of namedOutcomes) {
+      const score = teamSimilarity(entry.label, outcome.name);
+      if (!best || score > best.score) {
+        best = { outcomeName: outcome.name, score };
+      }
+    }
+
+    if (best && best.score >= 0.5) {
+      mapped[best.outcomeName] = entry.point;
+    }
+  }
+
+  if (Object.keys(mapped).length === 1 && entries.length === 1) {
+    const firstName = Object.keys(mapped)[0];
+    const secondName = namedOutcomes.find((outcome) => outcome.name !== firstName).name;
+    mapped[secondName] = -mapped[firstName];
+  }
+
+  return Object.keys(mapped).length === 2 ? mapped : null;
 }
 
 function toUtcDateOnly(value) {
@@ -391,6 +587,7 @@ function pickTeamProbabilityFromYesNoMarkets(event, teamName, compareConfig, opt
       !outcomes.length ||
       marketType !== "yes_no_team_win" ||
       !marketRule ||
+      !isActionablePolymarketMarket(event, market) ||
       !questionImpliesTeamWin(market.question, teamName, {
         referenceDates: options.referenceDates,
         requireQuestionDateMatch: Boolean(marketRule.requireQuestionDateMatch),
@@ -429,6 +626,125 @@ function getCompareLimit() {
   return Math.floor(parsed);
 }
 
+function buildNamedSidesRow(event, market, matched, odds, marketType) {
+  const pmHome = pickPolymarketSideProbability(market.outcomes, odds.home_team);
+  const pmAway = pickPolymarketSideProbability(market.outcomes, odds.away_team);
+  if (pmHome === null || pmAway === null) {
+    return null;
+  }
+
+  const oddsHome = impliedProbFromDecimal(odds.home_best);
+  const oddsAway = impliedProbFromDecimal(odds.away_best);
+  if (oddsHome === null || oddsAway === null) {
+    return null;
+  }
+
+  return {
+    polymarket_event_id: event.id,
+    polymarket_market_id: market.id || marketType,
+    sport: matched.game.sport_title,
+    game: `${matched.game.away_team} @ ${matched.game.home_team}`,
+    start: matched.game.commence_time,
+    market_type: marketType,
+    market_question: market.question || "",
+    market_line: market.line ?? null,
+    side_a_label: odds.home_team,
+    pm_a: pmHome,
+    odds_a: oddsHome,
+    edge_a_pp: (pmHome - oddsHome) * 100,
+    side_b_label: odds.away_team,
+    pm_b: pmAway,
+    odds_b: oddsAway,
+    edge_b_pp: (pmAway - oddsAway) * 100,
+    match_score: matched.score,
+  };
+}
+
+function buildOverUnderRow(event, market, matched) {
+  const probabilities = pickOverUnderProbabilities(market.outcomes);
+  if (!probabilities || !Number.isFinite(Number(market.line))) {
+    return null;
+  }
+
+  const odds = getBestTotalOdds(dbHandle, matched.game.game_id, Number(market.line));
+  if (!odds) {
+    return null;
+  }
+
+  const oddsOver = impliedProbFromDecimal(odds.over_best);
+  const oddsUnder = impliedProbFromDecimal(odds.under_best);
+  if (oddsOver === null || oddsUnder === null) {
+    return null;
+  }
+
+  return {
+    polymarket_event_id: event.id,
+    polymarket_market_id: market.id || "total_over_under",
+    sport: matched.game.sport_title,
+    game: `${matched.game.away_team} @ ${matched.game.home_team}`,
+    start: matched.game.commence_time,
+    market_type: "total_over_under",
+    market_question: market.question || "",
+    market_line: Number(market.line),
+    side_a_label: "Over",
+    pm_a: probabilities.Over,
+    odds_a: oddsOver,
+    edge_a_pp: (probabilities.Over - oddsOver) * 100,
+    side_b_label: "Under",
+    pm_b: probabilities.Under,
+    odds_b: oddsUnder,
+    edge_b_pp: (probabilities.Under - oddsUnder) * 100,
+    match_score: matched.score,
+  };
+}
+
+function buildSpreadRow(event, market, matched) {
+  const outcomePoints = mapSpreadOutcomePoints(market.question, market.outcomes);
+  if (!outcomePoints) {
+    return null;
+  }
+
+  const odds = getBestSpreadOdds(dbHandle, matched.game.game_id, outcomePoints);
+  if (!odds) {
+    return null;
+  }
+
+  const outcomeNames = Object.keys(outcomePoints);
+  const firstName = outcomeNames[0];
+  const secondName = outcomeNames[1];
+  const pmFirst = pickPolymarketSideProbability(market.outcomes, firstName);
+  const pmSecond = pickPolymarketSideProbability(market.outcomes, secondName);
+  if (pmFirst === null || pmSecond === null) {
+    return null;
+  }
+
+  const oddsFirst = impliedProbFromDecimal(odds[firstName]);
+  const oddsSecond = impliedProbFromDecimal(odds[secondName]);
+  if (oddsFirst === null || oddsSecond === null) {
+    return null;
+  }
+
+  return {
+    polymarket_event_id: event.id,
+    polymarket_market_id: market.id || "spread",
+    sport: matched.game.sport_title,
+    game: `${matched.game.away_team} @ ${matched.game.home_team}`,
+    start: matched.game.commence_time,
+    market_type: "spread",
+    market_question: market.question || "",
+    market_line: Number(market.line),
+    side_a_label: `${firstName} (${outcomePoints[firstName] > 0 ? "+" : ""}${outcomePoints[firstName]})`,
+    pm_a: pmFirst,
+    odds_a: oddsFirst,
+    edge_a_pp: (pmFirst - oddsFirst) * 100,
+    side_b_label: `${secondName} (${outcomePoints[secondName] > 0 ? "+" : ""}${outcomePoints[secondName]})`,
+    pm_b: pmSecond,
+    odds_b: oddsSecond,
+    edge_b_pp: (pmSecond - oddsSecond) * 100,
+    match_score: matched.score,
+  };
+}
+
 function formatPct(x) {
   if (!Number.isFinite(x)) {
     return "-";
@@ -436,11 +752,14 @@ function formatPct(x) {
   return `${(x * 100).toFixed(2)}%`;
 }
 
+let dbHandle = null;
+
 function main() {
   const dbPath = process.env.DB_PATH || path.join(process.cwd(), "data", "sportbets.db");
   const pmPath = process.env.POLYMARKET_EVENTS_FILE || path.join(process.cwd(), "data", "polymarket_events.jsonl");
 
   const db = new Database(dbPath, { readonly: true });
+  dbHandle = db;
   try {
     const events = readJsonl(pmPath).filter(
       (e) => Array.isArray(e.markets) && e.markets.length > 0
@@ -464,21 +783,69 @@ function main() {
         continue;
       }
 
-      const bestMarket = pickBestMarketForTeams(
+      const bestMoneylineMarket = pickBestMarketForTeams(
         event,
         odds.home_team,
         odds.away_team,
         compareConfig
       );
-      let pmHome = bestMarket && bestMarket.score >= 0.5 ? bestMarket.home : null;
-      let pmAway = bestMarket && bestMarket.score >= 0.5 ? bestMarket.away : null;
-      let marketType = bestMarket ? bestMarket.type : null;
-      let marketQuestion = bestMarket ? bestMarket.question : null;
+      if (bestMoneylineMarket && bestMoneylineMarket.score >= 0.5) {
+        const moneylineRow = buildNamedSidesRow(
+          event,
+          bestMoneylineMarket,
+          matched,
+          odds,
+          "match_winner"
+        );
+        if (moneylineRow) {
+          const dedupeKey = `${event.id}::${matched.game.game_id}::${moneylineRow.polymarket_market_id}`;
+          if (!seen.has(dedupeKey)) {
+            seen.add(dedupeKey);
+            rows.push(moneylineRow);
+          }
+        }
+      }
+
+      for (const market of event.markets || []) {
+        const marketType = resolveComparableMarketType(event, market);
+        const rule = getCompareMarketRule(marketType, compareConfig);
+        if (
+          !rule ||
+          marketType === "match_winner" ||
+          marketType === "yes_no_team_win" ||
+          !isActionablePolymarketMarket(event, market)
+        ) {
+          continue;
+        }
+
+        let row = null;
+        if (rule.comparisonStrategy === "over_under_line") {
+          row = buildOverUnderRow(event, market, matched);
+        } else if (rule.comparisonStrategy === "named_sides_line") {
+          row = buildSpreadRow(event, market, matched);
+        }
+
+        if (!row) {
+          continue;
+        }
+
+        const dedupeKey = `${event.id}::${matched.game.game_id}::${row.polymarket_market_id}`;
+        if (seen.has(dedupeKey)) {
+          continue;
+        }
+        seen.add(dedupeKey);
+        rows.push(row);
+      }
+
+      let pmHome = null;
+      let pmAway = null;
+      let marketType = null;
+      let marketQuestion = null;
       const referenceDates = [matched.game.commence_time];
 
       // Many Polymarket sports events provide separate yes/no markets:
       // "Will Team A win?" and "Will Team B win?".
-      if (pmHome === null) {
+      if (getCompareMarketRule("yes_no_team_win", compareConfig)) {
         const homeMarket = pickTeamProbabilityFromYesNoMarkets(
           event,
           odds.home_team,
@@ -486,12 +853,10 @@ function main() {
           { referenceDates }
         );
         pmHome = homeMarket ? homeMarket.probability : null;
-        if (!marketType && homeMarket) {
+        if (homeMarket) {
           marketType = homeMarket.type;
           marketQuestion = homeMarket.question;
         }
-      }
-      if (pmAway === null) {
         const awayMarket = pickTeamProbabilityFromYesNoMarkets(
           event,
           odds.away_team,
@@ -499,64 +864,64 @@ function main() {
           { referenceDates }
         );
         pmAway = awayMarket ? awayMarket.probability : null;
-        if (!marketType && awayMarket) {
-          marketType = awayMarket.type;
-          marketQuestion = awayMarket.question;
+      }
+
+      if (pmHome !== null && pmAway !== null) {
+        const oddsHome = impliedProbFromDecimal(odds.home_best);
+        const oddsAway = impliedProbFromDecimal(odds.away_best);
+        if (oddsHome !== null && oddsAway !== null) {
+          const dedupeKey = `${event.id}::${matched.game.game_id}::yes_no_team_win`;
+          if (!seen.has(dedupeKey)) {
+            seen.add(dedupeKey);
+            rows.push({
+              polymarket_event_id: event.id,
+              polymarket_market_id: "yes_no_team_win",
+              sport: matched.game.sport_title,
+              game: `${matched.game.away_team} @ ${matched.game.home_team}`,
+              start: matched.game.commence_time,
+              market_type: marketType || "yes_no_team_win",
+              market_question: marketQuestion || "yes_no_team_markets",
+              market_line: null,
+              side_a_label: odds.home_team,
+              pm_a: pmHome,
+              odds_a: oddsHome,
+              edge_a_pp: (pmHome - oddsHome) * 100,
+              side_b_label: odds.away_team,
+              pm_b: pmAway,
+              odds_b: oddsAway,
+              edge_b_pp: (pmAway - oddsAway) * 100,
+              match_score: matched.score,
+            });
+          }
         }
       }
-
-      if (pmHome === null || pmAway === null) {
-        continue;
-      }
-
-      const oddsHome = impliedProbFromDecimal(odds.home_best);
-      const oddsAway = impliedProbFromDecimal(odds.away_best);
-      if (oddsHome === null || oddsAway === null) {
-        continue;
-      }
-
-      const dedupeKey = `${event.id}::${matched.game.game_id}`;
-      if (seen.has(dedupeKey)) {
-        continue;
-      }
-      seen.add(dedupeKey);
-
-      rows.push({
-        polymarket_event_id: event.id,
-        sport: matched.game.sport_title,
-        game: `${matched.game.away_team} @ ${matched.game.home_team}`,
-        start: matched.game.commence_time,
-        pm_home: pmHome,
-        odds_home: oddsHome,
-        edge_home_pp: (pmHome - oddsHome) * 100,
-        pm_away: pmAway,
-        odds_away: oddsAway,
-        edge_away_pp: (pmAway - oddsAway) * 100,
-        market_question: marketQuestion || "yes_no_team_markets",
-        market_type: marketType || "yes_no_team_win",
-        match_score: matched.score,
-      });
     }
 
-    rows.sort((a, b) => Math.abs(b.edge_home_pp) + Math.abs(b.edge_away_pp) - (Math.abs(a.edge_home_pp) + Math.abs(a.edge_away_pp)));
+    rows.sort(
+      (a, b) =>
+        Math.max(Math.abs(b.edge_a_pp), Math.abs(b.edge_b_pp)) -
+        Math.max(Math.abs(a.edge_a_pp), Math.abs(a.edge_b_pp))
+    );
 
     if (!rows.length) {
       console.log("No directly comparable Polymarket vs Odds events found.");
       return;
     }
 
-    console.log("| Sport | Match | Start (UTC) | PM Type | Polymarket Market | PM Home | Odds Home | Delta Home | PM Away | Odds Away | Delta Away |");
-    console.log("|---|---|---|---|---|---:|---:|---:|---:|---:|---:|");
+    console.log("| Sport | Match | Start (UTC) | PM Type | Line | Polymarket Market | Outcome A | PM A | Odds A | Delta A | Outcome B | PM B | Odds B | Delta B |");
+    console.log("|---|---|---|---|---:|---|---|---:|---:|---:|---|---:|---:|---:|");
     const visibleRows = Number.isFinite(compareLimit)
       ? rows.slice(0, compareLimit)
       : rows;
     for (const r of visibleRows) {
-      const dh = `${r.edge_home_pp >= 0 ? "+" : ""}${r.edge_home_pp.toFixed(2)}pp`;
-      const da = `${r.edge_away_pp >= 0 ? "+" : ""}${r.edge_away_pp.toFixed(2)}pp`;
-      console.log(`| ${r.sport} | ${r.game} | ${r.start} | ${r.market_type} | ${r.market_question} | ${formatPct(r.pm_home)} | ${formatPct(r.odds_home)} | ${dh} | ${formatPct(r.pm_away)} | ${formatPct(r.odds_away)} | ${da} |`);
+      const da = `${r.edge_a_pp >= 0 ? "+" : ""}${r.edge_a_pp.toFixed(2)}pp`;
+      const dbDelta = `${r.edge_b_pp >= 0 ? "+" : ""}${r.edge_b_pp.toFixed(2)}pp`;
+      const line = r.market_line === null || r.market_line === undefined ? "" : Number(r.market_line);
+      console.log(`| ${r.sport} | ${r.game} | ${r.start} | ${r.market_type} | ${line} | ${r.market_question} | ${r.side_a_label} | ${formatPct(r.pm_a)} | ${formatPct(r.odds_a)} | ${da} | ${r.side_b_label} | ${formatPct(r.pm_b)} | ${formatPct(r.odds_b)} | ${dbDelta} |`);
     }
   } finally {
     db.close();
+    dbHandle = null;
   }
 }
 

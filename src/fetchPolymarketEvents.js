@@ -52,6 +52,18 @@ function buildOutputEvent(event) {
           return {
             id: String(m.id || "").trim(),
             question: String(m.question || "").trim(),
+            sportsMarketType: String(m.sportsMarketType || "").trim() || null,
+            line:
+              m.line === null || m.line === undefined || m.line === ""
+                ? null
+                : Number(m.line),
+            active: Boolean(m.active),
+            closed: Boolean(m.closed),
+            archived: Boolean(m.archived),
+            acceptingOrders: Boolean(m.acceptingOrders),
+            gameStartTime: toIsoOrNull(m.gameStartTime || m.startDate),
+            closedTime: toIsoOrNull(m.closedTime),
+            umaResolutionStatus: String(m.umaResolutionStatus || "").trim() || null,
             outcomes,
           };
         })

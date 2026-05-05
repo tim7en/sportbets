@@ -2,15 +2,24 @@ const { URL } = require("url");
 
 const DEFAULT_BASE_URL = "https://api.the-odds-api.com/v4";
 
-function parseSportsFromEnv(value) {
+function parseCsvFromEnv(value) {
   if (!value) {
     return [];
   }
 
-  return value
+  return String(value)
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+function parseSportsFromEnv(value) {
+  return parseCsvFromEnv(value);
+}
+
+function parseMarketsFromEnv(value) {
+  const parsed = parseCsvFromEnv(value);
+  return parsed.length > 0 ? parsed : ["h2h"];
 }
 
 function isoNow() {
@@ -134,6 +143,173 @@ async function resolveSportsToFetch(client, config) {
     .slice(0, Math.max(0, remainingCalls));
 }
 
+function cloneOutcome(outcome) {
+  return {
+    ...outcome,
+  };
+}
+
+function cloneMarket(market) {
+  return {
+    ...market,
+    outcomes: Array.isArray(market.outcomes)
+      ? market.outcomes.map(cloneOutcome)
+      : [],
+  };
+}
+
+function cloneBookmaker(bookmaker) {
+  return {
+    ...bookmaker,
+    markets: Array.isArray(bookmaker.markets)
+      ? bookmaker.markets.map(cloneMarket)
+      : [],
+  };
+}
+
+function cloneGame(game) {
+  return {
+    ...game,
+    bookmakers: Array.isArray(game.bookmakers)
+      ? game.bookmakers.map(cloneBookmaker)
+      : [],
+  };
+}
+
+function mergeBookmakerMarkets(targetBookmaker, incomingBookmaker) {
+  targetBookmaker.title = incomingBookmaker.title || targetBookmaker.title;
+  targetBookmaker.last_update =
+    incomingBookmaker.last_update || targetBookmaker.last_update || null;
+
+  const marketMap = new Map(
+    (targetBookmaker.markets || []).map((market) => [market.key, market])
+  );
+
+  for (const incomingMarket of incomingBookmaker.markets || []) {
+    const existingMarket = marketMap.get(incomingMarket.key);
+    if (!existingMarket) {
+      const cloned = cloneMarket(incomingMarket);
+      targetBookmaker.markets.push(cloned);
+      marketMap.set(cloned.key, cloned);
+      continue;
+    }
+
+    existingMarket.last_update =
+      incomingMarket.last_update || existingMarket.last_update || null;
+    const outcomeMap = new Map(
+      (existingMarket.outcomes || []).map((outcome) => [
+        `${String(outcome.name || "")}::${String(outcome.point ?? "")}`,
+        outcome,
+      ])
+    );
+
+    for (const incomingOutcome of incomingMarket.outcomes || []) {
+      const outcomeKey = `${String(incomingOutcome.name || "")}::${String(
+        incomingOutcome.point ?? ""
+      )}`;
+      if (!outcomeMap.has(outcomeKey)) {
+        existingMarket.outcomes.push(cloneOutcome(incomingOutcome));
+        continue;
+      }
+
+      Object.assign(outcomeMap.get(outcomeKey), cloneOutcome(incomingOutcome));
+    }
+  }
+}
+
+function mergeGames(existingGame, incomingGame) {
+  existingGame.sport_key = incomingGame.sport_key || existingGame.sport_key;
+  existingGame.sport_title = incomingGame.sport_title || existingGame.sport_title;
+  existingGame.commence_time = incomingGame.commence_time || existingGame.commence_time;
+  existingGame.home_team = incomingGame.home_team || existingGame.home_team;
+  existingGame.away_team = incomingGame.away_team || existingGame.away_team;
+  existingGame.last_seen_at = incomingGame.last_seen_at || existingGame.last_seen_at;
+
+  const bookmakerMap = new Map(
+    (existingGame.bookmakers || []).map((bookmaker) => [bookmaker.key, bookmaker])
+  );
+
+  for (const incomingBookmaker of incomingGame.bookmakers || []) {
+    const existingBookmaker = bookmakerMap.get(incomingBookmaker.key);
+    if (!existingBookmaker) {
+      const cloned = cloneBookmaker(incomingBookmaker);
+      existingGame.bookmakers.push(cloned);
+      bookmakerMap.set(cloned.key, cloned);
+      continue;
+    }
+
+    mergeBookmakerMarkets(existingBookmaker, incomingBookmaker);
+  }
+}
+
+function buildMarketVariants(marketsValue) {
+  const markets = parseMarketsFromEnv(marketsValue);
+  if (markets.length <= 1) {
+    return [markets];
+  }
+
+  return [markets, ...markets.map((marketKey) => [marketKey])];
+}
+
+async function fetchSportGames(client, sportKey, config, window) {
+  const variants = buildMarketVariants(config.markets || "h2h");
+  const mergedGames = new Map();
+
+  for (const marketKeys of variants) {
+    const usage = client.getUsage();
+    if (usage.callsUsed >= usage.maxCalls) {
+      break;
+    }
+
+    let games = [];
+    try {
+      games = await client.request(`/sports/${sportKey}/odds`, {
+        regions: config.regions || "us",
+        markets: marketKeys.join(","),
+        oddsFormat: config.oddsFormat || "decimal",
+        dateFormat: config.dateFormat || "iso",
+        commenceTimeFrom: window.from,
+        commenceTimeTo: window.to,
+      });
+    } catch (err) {
+      if (String(err.message || "").includes("INVALID_MARKET_COMBO")) {
+        continue;
+      }
+      throw err;
+    }
+
+    for (const game of games) {
+      if (!game || !game.id || !game.commence_time) {
+        continue;
+      }
+
+      const normalized = {
+        game_id: game.id,
+        sport_key: game.sport_key || sportKey,
+        sport_title: game.sport_title || sportKey,
+        commence_time: game.commence_time,
+        home_team: game.home_team || null,
+        away_team: game.away_team || null,
+        last_seen_at: isoNow(),
+        bookmakers: Array.isArray(game.bookmakers) ? game.bookmakers : [],
+      };
+
+      if (!mergedGames.has(normalized.game_id)) {
+        mergedGames.set(normalized.game_id, cloneGame(normalized));
+        continue;
+      }
+
+      mergeGames(mergedGames.get(normalized.game_id), normalized);
+    }
+
+    if (variants[0] === marketKeys) {
+      break;
+    }
+  }
+
+  return Array.from(mergedGames.values());
+}
+
 async function fetchTodayGamesAndOdds(config) {
   const client = createOddsClient(config);
   const sports = await resolveSportsToFetch(client, config);
@@ -153,25 +329,10 @@ async function fetchTodayGamesAndOdds(config) {
       break;
     }
 
-    let games = [];
-    try {
-      games = await client.request(`/sports/${sportKey}/odds`, {
-        regions: config.regions || "us",
-        markets: config.markets || "h2h",
-        oddsFormat: config.oddsFormat || "decimal",
-        dateFormat: config.dateFormat || "iso",
-        commenceTimeFrom: window.from,
-        commenceTimeTo: window.to,
-      });
-    } catch (err) {
-      if (String(err.message || "").includes("INVALID_MARKET_COMBO")) {
-        continue;
-      }
-      throw err;
-    }
+    const games = await fetchSportGames(client, sportKey, config, window);
 
     for (const game of games) {
-      if (!game || !game.id || !game.commence_time) {
+      if (!game || !game.game_id || !game.commence_time) {
         continue;
       }
 
@@ -191,7 +352,7 @@ async function fetchTodayGamesAndOdds(config) {
       }
 
       results.push({
-        game_id: game.id,
+        game_id: game.game_id,
         sport_key: game.sport_key || sportKey,
         sport_title: game.sport_title || sportKey,
         commence_time: game.commence_time,
