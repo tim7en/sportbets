@@ -9,7 +9,10 @@
     "export:edge": "node src/exportEdgeCandidates.js",
     "table:upcoming": "node src/printUpcomingTable.js",
     "fetch:odds:50": "set ODDS_API_MAX_CALLS=50&& node src/index.js",
-    "map:polymarket": "node src/polymarketMapper.js"
+    "fetch:polymarket": "node src/fetchPolymarketEvents.js",
+    "list:polymarket:types": "node src/listPolymarketBetTypes.js",
+    "map:polymarket": "node src/polymarketMapper.js",
+    "compare:polymarket": "node src/comparePolymarketOdds.js"
   },
   "engines": {
     "node": ">=18"

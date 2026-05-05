@@ -9,6 +9,17 @@ function normalizeTeamName(value) {
     .toLowerCase();
 
   const expanded = lowered
+    .replace(/\bman\s+city\b/g, "manchester city")
+    .replace(/\bman\s+united\b/g, "manchester united")
+    .replace(/\bpsg\b/g, "paris saint germain")
+    .replace(/\binter\b/g, "internazionale")
+    .replace(/\batletico\b/g, "atletico")
+    .replace(/\bbayern\b/g, "bayern munich")
+    .replace(/\bspurs\b/g, "tottenham hotspur")
+    .replace(/\bnewcastle\b/g, "newcastle united")
+    .replace(/\bqpr\b/g, "queens park rangers")
+    .replace(/\bst\.?\b/g, "saint")
+    .replace(/\bathletic\b/g, "athletic")
     .replace(/\bkf\.?\b/g, "kameratene forening")
     .replace(/\bkfum\b/g, "kf um")
     .replace(/\bfc\b/g, "")
