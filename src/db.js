@@ -44,6 +44,63 @@ function createDatabase(dbPath = path.join(process.cwd(), "data", "sportbets.db"
 
     CREATE INDEX IF NOT EXISTS idx_games_commence_time ON games(commence_time);
     CREATE INDEX IF NOT EXISTS idx_games_sport_key ON games(sport_key);
+
+    CREATE TABLE IF NOT EXISTS team_entities (
+      team_entity_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      canonical_name TEXT NOT NULL,
+      normalized_name TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS team_aliases (
+      team_alias_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      team_entity_id INTEGER NOT NULL,
+      source TEXT NOT NULL,
+      alias_name TEXT NOT NULL,
+      alias_normalized TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(source, alias_normalized),
+      FOREIGN KEY (team_entity_id) REFERENCES team_entities(team_entity_id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS polymarket_events (
+      polymarket_event_id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      slug TEXT,
+      sport_hint TEXT,
+      start_time TEXT,
+      raw_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS event_mappings (
+      polymarket_event_id TEXT PRIMARY KEY,
+      game_id TEXT,
+      confidence_score REAL NOT NULL,
+      status TEXT NOT NULL,
+      reason TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (polymarket_event_id) REFERENCES polymarket_events(polymarket_event_id) ON DELETE CASCADE,
+      FOREIGN KEY (game_id) REFERENCES games(game_id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS mapping_overrides (
+      polymarket_event_id TEXT PRIMARY KEY,
+      game_id TEXT NOT NULL,
+      note TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (polymarket_event_id) REFERENCES polymarket_events(polymarket_event_id) ON DELETE CASCADE,
+      FOREIGN KEY (game_id) REFERENCES games(game_id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_team_aliases_normalized ON team_aliases(alias_normalized);
+    CREATE INDEX IF NOT EXISTS idx_polymarket_events_start_time ON polymarket_events(start_time);
+    CREATE INDEX IF NOT EXISTS idx_event_mappings_status ON event_mappings(status);
+    CREATE INDEX IF NOT EXISTS idx_mapping_overrides_game_id ON mapping_overrides(game_id);
   `);
 
   return db;
