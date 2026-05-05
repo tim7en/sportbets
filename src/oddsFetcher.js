@@ -21,6 +21,23 @@ function toApiIsoNoMs(date) {
   return date.toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
+function getTomorrowEndUtc(now = new Date()) {
+  const d = new Date(now);
+  d.setUTCDate(d.getUTCDate() + 1);
+  d.setUTCHours(23, 59, 59, 0);
+  return d;
+}
+
+function getEndOfNextWeekUtc(now = new Date()) {
+  const currentDay = now.getUTCDay(); // 0=Sun, 1=Mon ... 6=Sat
+  const daysUntilSunday = (7 - currentDay) % 7;
+
+  const end = new Date(now);
+  end.setUTCDate(now.getUTCDate() + daysUntilSunday + 7);
+  end.setUTCHours(23, 59, 59, 0);
+  return end;
+}
+
 function getTodayWindowUtc(now = new Date()) {
   const start = new Date(now);
   start.setUTCHours(0, 0, 0, 0);
@@ -38,6 +55,20 @@ function isTodayUtc(isoDate, now = new Date()) {
     d.getUTCMonth() === now.getUTCMonth() &&
     d.getUTCDate() === now.getUTCDate()
   );
+}
+
+function getPlannedWindowTodayTomorrowUtc(now = new Date()) {
+  return {
+    from: toApiIsoNoMs(now),
+    to: toApiIsoNoMs(getTomorrowEndUtc(now)),
+  };
+}
+
+function getPlannedWindowThisAndNextWeekUtc(now = new Date()) {
+  return {
+    from: toApiIsoNoMs(now),
+    to: toApiIsoNoMs(getEndOfNextWeekUtc(now)),
+  };
 }
 
 function createOddsClient(config) {
@@ -107,7 +138,13 @@ async function fetchTodayGamesAndOdds(config) {
   const client = createOddsClient(config);
   const sports = await resolveSportsToFetch(client, config);
   const now = new Date();
-  const todayWindow = getTodayWindowUtc(now);
+  const fetchMode = (config.fetchMode || "active_today").trim();
+  const window =
+    fetchMode === "planned_today_tomorrow"
+      ? getPlannedWindowTodayTomorrowUtc(now)
+      : fetchMode === "planned_this_and_next_week"
+      ? getPlannedWindowThisAndNextWeekUtc(now)
+      : getTodayWindowUtc(now);
 
   const results = [];
   for (const sportKey of sports) {
@@ -123,8 +160,8 @@ async function fetchTodayGamesAndOdds(config) {
         markets: config.markets || "h2h",
         oddsFormat: config.oddsFormat || "decimal",
         dateFormat: config.dateFormat || "iso",
-        commenceTimeFrom: todayWindow.from,
-        commenceTimeTo: todayWindow.to,
+        commenceTimeFrom: window.from,
+        commenceTimeTo: window.to,
       });
     } catch (err) {
       if (String(err.message || "").includes("INVALID_MARKET_COMBO")) {
@@ -139,9 +176,17 @@ async function fetchTodayGamesAndOdds(config) {
       }
 
       // The free API does not expose a strict live flag in this endpoint,
-      // so we treat games that started today and before now as ongoing candidates.
+      // so active_today means games started today and before now.
       const commence = new Date(game.commence_time);
-      if (!isTodayUtc(game.commence_time, now) || commence > now) {
+      if (fetchMode === "planned_today_tomorrow") {
+        if (commence < now || commence > getTomorrowEndUtc(now)) {
+          continue;
+        }
+      } else if (fetchMode === "planned_this_and_next_week") {
+        if (commence < now || commence > getEndOfNextWeekUtc(now)) {
+          continue;
+        }
+      } else if (!isTodayUtc(game.commence_time, now) || commence > now) {
         continue;
       }
 

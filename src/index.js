@@ -14,6 +14,7 @@ function readConfigFromEnv() {
     markets: process.env.ODDS_API_MARKETS || "h2h",
     oddsFormat: process.env.ODDS_API_ODDS_FORMAT || "decimal",
     dateFormat: process.env.ODDS_API_DATE_FORMAT || "iso",
+    fetchMode: process.env.ODDS_API_FETCH_MODE || "active_today",
     sports: process.env.ODDS_API_SPORTS || "",
     dbPath: process.env.DB_PATH || path.join(process.cwd(), "data", "sportbets.db"),
   };
