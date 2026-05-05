@@ -1,0 +1,17 @@
+{
+  "name": "sportbets",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fetches daily odds data from The Odds API and stores it in SQLite",
+  "main": "src/index.js",
+  "scripts": {
+    "fetch:odds": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "dotenv": "^16.4.5"
+  }
+}
