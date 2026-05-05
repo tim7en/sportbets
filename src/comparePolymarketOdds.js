@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const Database = require("better-sqlite3");
 const { parseMatchTeams, teamSimilarity } = require("./nameMatch");
+const { classifyQuestion } = require("./polymarketMarketTypes");
 
 const FORBIDDEN_EVENT_TITLE_PATTERNS = [
   /more markets/i,
@@ -20,37 +21,6 @@ const FORBIDDEN_EVENT_TITLE_PATTERNS = [
   /round\s+\d+/i,
   /to advance/i,
   /to lift/i,
-];
-
-const FORBIDDEN_MARKET_QUESTION_PATTERNS = [
-  /^spread:/i,
-  /\bo\/?u\b/i,
-  /over\/under/i,
-  /both teams to score/i,
-  /corners?/i,
-  /cards?/i,
-  /shots?/i,
-  /fouls?/i,
-  /offsides?/i,
-  /handicap/i,
-  /margin/i,
-  /team total/i,
-  /first half/i,
-  /second half/i,
-  /1st half/i,
-  /2nd half/i,
-  /\bgame\s+\d+\s+winner\b/i,
-  /quarter/i,
-  /period/i,
-  /set\b/i,
-  /map\b/i,
-  /player/i,
-  /qualif(y|ier|ication)/i,
-  /to advance/i,
-  /to lift/i,
-  /winner/i,
-  /champion/i,
-  /top goalscorer/i,
 ];
 
 function isForbiddenByPatterns(value, patterns) {
@@ -125,10 +95,6 @@ function isComparableEventTitle(title) {
   return true;
 }
 
-function isStrictMarketQuestion(question) {
-  return !isForbiddenByPatterns(question, FORBIDDEN_MARKET_QUESTION_PATTERNS);
-}
-
 function readJsonl(filePath) {
   if (!fs.existsSync(filePath)) {
     return [];
@@ -155,6 +121,44 @@ function parseCsvEnv(value) {
     .split(",")
     .map((x) => x.trim())
     .filter(Boolean);
+}
+
+function resolveConfigPath(filePath) {
+  if (path.isAbsolute(filePath)) {
+    return filePath;
+  }
+
+  return path.join(process.cwd(), filePath);
+}
+
+function loadCompareMarketCrosswalk() {
+  const configuredPath = String(
+    process.env.COMPARE_MARKET_CROSSWALK_FILE ||
+      path.join("config", "polymarketMarketCrosswalk.js")
+  ).trim();
+  const resolvedPath = resolveConfigPath(configuredPath);
+  const loaded = require(resolvedPath);
+  const comparableMarkets = Array.isArray(loaded.comparableMarkets)
+    ? loaded.comparableMarkets
+        .filter((rule) => rule && rule.enabled !== false)
+        .filter((rule) => String(rule.bookmakerMarketKey || "h2h") === "h2h")
+    : [];
+
+  return {
+    filePath: resolvedPath,
+    comparableMarkets,
+    rulesByType: new Map(
+      comparableMarkets.map((rule) => [String(rule.type || "").trim(), rule])
+    ),
+  };
+}
+
+function isAllowedCompareMarketType(type, compareConfig) {
+  return compareConfig.rulesByType.has(String(type || "").trim());
+}
+
+function getCompareMarketRule(type, compareConfig) {
+  return compareConfig.rulesByType.get(String(type || "").trim()) || null;
 }
 
 function getDbGames(db, options = {}) {
@@ -270,16 +274,20 @@ function pickPolymarketSideProbability(outcomes, teamName) {
   return best.probability;
 }
 
-function pickBestMarketForTeams(event, homeTeam, awayTeam) {
+function pickBestMarketForTeams(event, homeTeam, awayTeam, allowedMarketTypes) {
   const markets = Array.isArray(event.markets) ? event.markets : [];
   let best = null;
 
   for (const market of markets) {
-    if (!isStrictMarketQuestion(market.question)) {
+    const outcomes = Array.isArray(market.outcomes) ? market.outcomes : [];
+    const marketType = classifyQuestion(event.title, market.question, outcomes);
+    if (
+      marketType !== "match_winner" ||
+      !isAllowedCompareMarketType(marketType, allowedMarketTypes)
+    ) {
       continue;
     }
 
-    const outcomes = Array.isArray(market.outcomes) ? market.outcomes : [];
     if (!outcomes.length) {
       continue;
     }
@@ -301,7 +309,14 @@ function pickBestMarketForTeams(event, homeTeam, awayTeam) {
     const score = (homeSim + awaySim) / 2;
 
     if (!best || score > best.score) {
-      best = { outcomes, home, away, score, question: market.question || "" };
+      best = {
+        outcomes,
+        home,
+        away,
+        score,
+        type: marketType,
+        question: market.question || "",
+      };
     }
   }
 
@@ -315,13 +330,35 @@ function pickYesProbability(outcomes) {
     : null;
 }
 
-function questionImpliesTeamWin(question, teamName) {
+function toUtcDateOnly(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) {
+    return null;
+  }
+
+  return date.toISOString().slice(0, 10);
+}
+
+function extractQuestionDate(question) {
+  const match = String(question || "").match(/\b(20\d{2}-\d{2}-\d{2})\b/);
+  return match ? match[1] : null;
+}
+
+function questionImpliesTeamWin(question, teamName, options = {}) {
   const q = String(question || "").trim();
   if (!q || !teamName) {
     return false;
   }
 
-  if (!isStrictMarketQuestion(q)) {
+  const questionDate = extractQuestionDate(q);
+  const referenceDates = Array.isArray(options.referenceDates)
+    ? options.referenceDates.map((value) => toUtcDateOnly(value)).filter(Boolean)
+    : [];
+  if (
+    questionDate &&
+    options.requireQuestionDateMatch &&
+    !referenceDates.includes(questionDate)
+  ) {
     return false;
   }
 
@@ -344,20 +381,52 @@ function questionImpliesTeamWin(question, teamName) {
   return Math.max(directSimilarity, wholeSimilarity) >= 0.5;
 }
 
-function pickTeamProbabilityFromYesNoMarkets(event, teamName) {
+function pickTeamProbabilityFromYesNoMarkets(event, teamName, compareConfig, options = {}) {
   const markets = Array.isArray(event.markets) ? event.markets : [];
   for (const market of markets) {
     const outcomes = Array.isArray(market.outcomes) ? market.outcomes : [];
-    if (!outcomes.length || !questionImpliesTeamWin(market.question, teamName)) {
+    const marketType = classifyQuestion(event.title, market.question, outcomes);
+    const marketRule = getCompareMarketRule(marketType, compareConfig);
+    if (
+      !outcomes.length ||
+      marketType !== "yes_no_team_win" ||
+      !marketRule ||
+      !questionImpliesTeamWin(market.question, teamName, {
+        referenceDates: options.referenceDates,
+        requireQuestionDateMatch: Boolean(marketRule.requireQuestionDateMatch),
+      })
+    ) {
       continue;
     }
 
     const p = pickYesProbability(outcomes);
     if (p !== null) {
-      return p;
+      return {
+        probability: p,
+        type: marketType,
+        question: market.question || "",
+      };
     }
   }
   return null;
+}
+
+function getCompareLimit() {
+  const raw = String(process.env.COMPARE_LIMIT || "30").trim().toLowerCase();
+  if (!raw) {
+    return 30;
+  }
+
+  if (raw === "all" || raw === "0") {
+    return Infinity;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 30;
+  }
+
+  return Math.floor(parsed);
 }
 
 function formatPct(x) {
@@ -376,6 +445,8 @@ function main() {
     const events = readJsonl(pmPath).filter(
       (e) => Array.isArray(e.markets) && e.markets.length > 0
     );
+    const compareConfig = loadCompareMarketCrosswalk();
+    const compareLimit = getCompareLimit();
     const games = getDbGames(db, {
       sportKeys: process.env.COMPARE_SPORT_KEYS || "",
     });
@@ -393,17 +464,45 @@ function main() {
         continue;
       }
 
-      const bestMarket = pickBestMarketForTeams(event, odds.home_team, odds.away_team);
+      const bestMarket = pickBestMarketForTeams(
+        event,
+        odds.home_team,
+        odds.away_team,
+        compareConfig
+      );
       let pmHome = bestMarket && bestMarket.score >= 0.5 ? bestMarket.home : null;
       let pmAway = bestMarket && bestMarket.score >= 0.5 ? bestMarket.away : null;
+      let marketType = bestMarket ? bestMarket.type : null;
+      let marketQuestion = bestMarket ? bestMarket.question : null;
+      const referenceDates = [matched.game.commence_time];
 
       // Many Polymarket sports events provide separate yes/no markets:
       // "Will Team A win?" and "Will Team B win?".
       if (pmHome === null) {
-        pmHome = pickTeamProbabilityFromYesNoMarkets(event, odds.home_team);
+        const homeMarket = pickTeamProbabilityFromYesNoMarkets(
+          event,
+          odds.home_team,
+          compareConfig,
+          { referenceDates }
+        );
+        pmHome = homeMarket ? homeMarket.probability : null;
+        if (!marketType && homeMarket) {
+          marketType = homeMarket.type;
+          marketQuestion = homeMarket.question;
+        }
       }
       if (pmAway === null) {
-        pmAway = pickTeamProbabilityFromYesNoMarkets(event, odds.away_team);
+        const awayMarket = pickTeamProbabilityFromYesNoMarkets(
+          event,
+          odds.away_team,
+          compareConfig,
+          { referenceDates }
+        );
+        pmAway = awayMarket ? awayMarket.probability : null;
+        if (!marketType && awayMarket) {
+          marketType = awayMarket.type;
+          marketQuestion = awayMarket.question;
+        }
       }
 
       if (pmHome === null || pmAway === null) {
@@ -433,7 +532,8 @@ function main() {
         pm_away: pmAway,
         odds_away: oddsAway,
         edge_away_pp: (pmAway - oddsAway) * 100,
-        market_question: bestMarket ? bestMarket.question : "yes_no_team_markets",
+        market_question: marketQuestion || "yes_no_team_markets",
+        market_type: marketType || "yes_no_team_win",
         match_score: matched.score,
       });
     }
@@ -445,12 +545,15 @@ function main() {
       return;
     }
 
-    console.log("| Sport | Match | Start (UTC) | Polymarket Market | PM Home | Odds Home | Delta Home | PM Away | Odds Away | Delta Away |");
-    console.log("|---|---|---|---|---:|---:|---:|---:|---:|---:|");
-    for (const r of rows.slice(0, 30)) {
+    console.log("| Sport | Match | Start (UTC) | PM Type | Polymarket Market | PM Home | Odds Home | Delta Home | PM Away | Odds Away | Delta Away |");
+    console.log("|---|---|---|---|---|---:|---:|---:|---:|---:|---:|");
+    const visibleRows = Number.isFinite(compareLimit)
+      ? rows.slice(0, compareLimit)
+      : rows;
+    for (const r of visibleRows) {
       const dh = `${r.edge_home_pp >= 0 ? "+" : ""}${r.edge_home_pp.toFixed(2)}pp`;
       const da = `${r.edge_away_pp >= 0 ? "+" : ""}${r.edge_away_pp.toFixed(2)}pp`;
-      console.log(`| ${r.sport} | ${r.game} | ${r.start} | ${r.market_question} | ${formatPct(r.pm_home)} | ${formatPct(r.odds_home)} | ${dh} | ${formatPct(r.pm_away)} | ${formatPct(r.odds_away)} | ${da} |`);
+      console.log(`| ${r.sport} | ${r.game} | ${r.start} | ${r.market_type} | ${r.market_question} | ${formatPct(r.pm_home)} | ${formatPct(r.odds_home)} | ${dh} | ${formatPct(r.pm_away)} | ${formatPct(r.odds_away)} | ${da} |`);
     }
   } finally {
     db.close();
